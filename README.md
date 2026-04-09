@@ -1,22 +1,21 @@
-# Rss-to-QQemail（GitHub Actions）
-
-定时从 OPML（RSS 订阅列表）抓取最近内容，并通过 SMTP 发送到邮箱。支持把邮件内容做成 **中英文对照：中文（英文）**。默认配置为：**每天北京时间 09:00** 运行一次。
+# rss-to-qqemail
+定时从 `feeds.opml`（RSS 订阅列表）抓取最近内容，并通过 SMTP 发送到邮箱。邮件内容为 **中英文对照：中文（英文）**（离线翻译，无需 Key）。默认配置为：**每天北京时间 09:00** 运行一次。
 
 ## 功能
 
-- 从指定 OPML 链接读取所有 `xmlUrl`（RSS/Atom）订阅源
+- 从仓库内 `feeds.opml` 读取所有 `xmlUrl`（RSS/Atom）订阅源（你以后只需要改这个文件来增删订阅）
 - 抓取最近 **24 小时**的新文章，汇总成一封邮件（HTML）
 - 对每个订阅源设置超时（避免卡住）；抓取失败会跳过并在邮件末尾列出失败列表
 - 通过 SMTP 发信（支持 `465/SMTP_SSL` 与 `587/STARTTLS`）
 - 离线翻译：使用 **Argos Translate** 把站点名/标题等翻译为中文，并输出 **中英文对照**（无需任何 API Key）
 
-## 订阅源（OPML）
+## 订阅源（feeds.opml）
 
-脚本默认使用这个 OPML（HN Popular Blogs 2025）：
+订阅源由仓库文件 `feeds.opml` 管理（只靠这个文件增删订阅）。
 
-- https://gist.github.com/emschwartz/e6d2bf860ccc367fe37ff953ba6de66b
-
-如需更换 OPML，请修改 `rss_mailer.py` 里的 `OPML_URL`。
+当前 `feeds.opml` 已包含：
+- HN Popular Blogs 2025（博客合集）
+- BestBlogs.dev AI（最近 1 天文章）
 
 ## 文件结构
 
@@ -24,6 +23,7 @@
 .
 ├── rss_mailer.py
 ├── requirements.txt
+├── feeds.opml
 └── .github/
     └── workflows/
         └── rss_mailer.yml
@@ -98,10 +98,18 @@ GitHub Actions 的 cron 使用 **UTC** 时区（不是北京时间）。
 
 ## 自定义
 
-### 修改订阅源
+### 新增/删除订阅源（只改 feeds.opml）
 
-编辑 `rss_mailer.py`：
-- `OPML_URL`：替换为你的 OPML raw 链接
+打开仓库根目录 `feeds.opml`，在任意 `<outline ...>` 分组里新增一行即可，例如：
+
+```xml
+<outline type="rss" text="某某站" title="某某站" xmlUrl="https://example.com/feed.xml"/>
+```
+
+**注意：**
+1. 如果 URL 里包含 `&`，必须写成 `&amp;`  
+   例如：`...rss?x=1&y=2` → `...rss?x=1&amp;y=2`
+2. 保存并 Commit 后就会生效；不需要改 `rss_mailer.py`、不需要改 Secrets、也不需要改 workflow。
 
 ### 修改抓取窗口（默认最近 24 小时）
 
@@ -133,3 +141,6 @@ EMAIL_SUBJECT: "每日 RSS 摘要"
 
 3. **定时触发有延迟**
    - GitHub 定时任务可能延迟几分钟，属于正常情况。
+
+4. **首次运行很慢**
+   - 多数情况下是在下载并安装 Argos 离线翻译模型；建议开启 workflow 里的 cache（README 上面已给出配置）。
