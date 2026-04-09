@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<opml version="2.0">
+  <head>
+    <title>My Feeds</title>
+  </head>
+  <body>
+    <outline text="My RSS" title="My RSS">
+      <outline type="rss" text="BestBlogs AI" title="BestBlogs AI"
+        xmlUrl="https://www.bestblogs.dev/feeds/rss?category=ai&amp;featured=y&amp;timeFilter=1d&amp;type=article"/>
+    </outline>
+  </body>
+</opml>
