@@ -13,15 +13,20 @@ from email.mime.text import MIMEText
 # 你提供的 OPML（raw 链接）
 OPML_URL = "https://gist.github.com/emschwartz/e6d2bf860ccc367fe37ff953ba6de66b/raw/426957f043dc0054f95aae6c19de1d0b4ecc2bb2/hn-popular-blogs-2025.opml"
 
+# 每个 feed 的网络超时（秒）——避免卡住
+FEED_TIMEOUT_SECONDS = 15
+# 每个 feed 最多取前 N 条来检查（越大越慢）
+PER_FEED_LIMIT = 10
 
-def download_text(url: str) -> str:
+
+def download_text(url: str, timeout: int = 60) -> str:
     req = Request(url, headers={"User-Agent": "rss-mailer/1.0"})
-    with urlopen(req, timeout=60) as r:
+    with urlopen(req, timeout=timeout) as r:
         return r.read().decode("utf-8", errors="replace")
 
 
 def load_feeds_from_opml_url(opml_url: str) -> list[str]:
-    content = download_text(opml_url)
+    content = download_text(opml_url, timeout=60)
     root = ET.fromstring(content)
 
     urls: list[str] = []
@@ -40,6 +45,29 @@ def load_feeds_from_opml_url(opml_url: str) -> list[str]:
     return out
 
 
+def fetch_feed_bytes(url: str, timeout: int) -> bytes:
+    req = Request(url, headers={"User-Agent": "rss-mailer/1.0"})
+    with urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def safe_parse_feed(url: str, timeout: int):
+    """
+    对每个 feed 单独设置超时；失败则返回 (None, error_message)。
+    """
+    try:
+        data = fetch_feed_bytes(url, timeout=timeout)
+        parsed = feedparser.parse(data)
+        # feedparser 有时会给出 bozo_exception
+        if getattr(parsed, "bozo", 0):
+            ex = getattr(parsed, "bozo_exception", None)
+            if ex:
+                return parsed, f"bozo_exception: {type(ex).__name__}: {ex}"
+        return parsed, None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
 def entry_time_utc(entry) -> datetime | None:
     for k in ("published", "updated"):
         v = entry.get(k)
@@ -55,13 +83,24 @@ def entry_time_utc(entry) -> datetime | None:
     return None
 
 
-def fetch_recent_items(feed_urls: list[str], since_utc: datetime, per_feed_limit: int = 10):
+def fetch_recent_items(feed_urls: list[str], since_utc: datetime, per_feed_limit: int):
     items = []
-    for url in feed_urls:
-        d = feedparser.parse(url)
-        feed_title = getattr(d.feed, "title", url) if hasattr(d, "feed") else url
+    failures = []  # (url, reason)
 
-        entries = getattr(d, "entries", [])[:per_feed_limit]
+    for url in feed_urls:
+        parsed, err = safe_parse_feed(url, timeout=FEED_TIMEOUT_SECONDS)
+        if parsed is None:
+            print(f"[SKIP] {url} -> {err}")
+            failures.append((url, err))
+            continue
+
+        if err:
+            # 可解析但有异常提示（不一定致命），也记录一下方便排查
+            print(f"[WARN] {url} -> {err}")
+
+        feed_title = getattr(parsed.feed, "title", url) if hasattr(parsed, "feed") else url
+        entries = getattr(parsed, "entries", [])[:per_feed_limit]
+
         for e in entries:
             t = entry_time_utc(e)
             if t and t < since_utc:
@@ -73,35 +112,47 @@ def fetch_recent_items(feed_urls: list[str], since_utc: datetime, per_feed_limit
                 "link": e.get("link", ""),
                 "time": (t.isoformat() if t else ""),
             })
-    return items
+
+    return items, failures
 
 
 def escape_html(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def build_html(items):
+def build_html(items, failures):
+    parts = []
+
     if not items:
-        return "<p>过去 24 小时没有抓到新的 RSS 条目。</p>"
+        parts.append("<p>过去 24 小时没有抓到新的 RSS 条目。</p>")
+    else:
+        by_feed = {}
+        for it in items:
+            by_feed.setdefault(it["feed"], []).append(it)
 
-    by_feed = {}
-    for it in items:
-        by_feed.setdefault(it["feed"], []).append(it)
+        parts.append(f"<p>每日 RSS 摘要（过去 24 小时，共 {len(items)} 条）</p>")
+        for feed, lst in by_feed.items():
+            parts.append(f"<h3>{escape_html(feed)}</h3><ul>")
+            for it in lst:
+                title = escape_html(it["title"])
+                link = it["link"]
+                time_s = escape_html(it["time"])
+                parts.append(f'<li><a href="{link}">{title}</a> <small>{time_s}</small></li>')
+            parts.append("</ul>")
 
-    parts = [f"<p>每日 RSS 摘要（过去 24 小时，共 {len(items)} 条）</p>"]
-    for feed, lst in by_feed.items():
-        parts.append(f"<h3>{escape_html(feed)}</h3><ul>")
-        for it in lst:
-            title = escape_html(it["title"])
-            link = it["link"]
-            time_s = escape_html(it["time"])
-            parts.append(f'<li><a href="{link}">{title}</a> <small>{time_s}</small></li>')
+    if failures:
+        parts.append(f"<hr/><p>抓取失败（已跳过）: {len(failures)} 个</p><ul>")
+        # 避免邮件太长，只列前 30 个
+        for url, reason in failures[:30]:
+            parts.append(f"<li><code>{escape_html(url)}</code><br/><small>{escape_html(reason)}</small></li>")
+        if len(failures) > 30:
+            parts.append(f"<li>……省略 {len(failures) - 30} 个</li>")
         parts.append("</ul>")
+
     return "\n".join(parts)
 
 
 def send_email_outlook(html_body: str):
-    # Outlook SMTP：STARTTLS
     smtp_host = os.environ.get("SMTP_HOST", "smtp-mail.outlook.com")
     smtp_port = int(os.environ.get("SMTP_PORT", "587"))
 
@@ -131,8 +182,9 @@ def main():
         raise RuntimeError("OPML 没有解析到任何 xmlUrl")
 
     since = datetime.now(timezone.utc) - timedelta(hours=24)
-    items = fetch_recent_items(feeds, since_utc=since, per_feed_limit=10)
-    html = build_html(items)
+
+    items, failures = fetch_recent_items(feeds, since_utc=since, per_feed_limit=PER_FEED_LIMIT)
+    html = build_html(items, failures)
     send_email_outlook(html)
 
 
