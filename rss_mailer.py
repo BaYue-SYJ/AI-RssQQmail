@@ -1,4 +1,5 @@
 import os
+import re
 import ssl
 import smtplib
 import feedparser
@@ -10,13 +11,15 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 
-# 你提供的 OPML（raw 链接）
+# OPML（raw 链接）
 OPML_URL = "https://gist.github.com/emschwartz/e6d2bf860ccc367fe37ff953ba6de66b/raw/426957f043dc0054f95aae6c19de1d0b4ecc2bb2/hn-popular-blogs-2025.opml"
 
 # 每个 feed 的网络超时（秒）——避免卡住
 FEED_TIMEOUT_SECONDS = 15
 # 每个 feed 最多取前 N 条来检查（越大越慢）
 PER_FEED_LIMIT = 10
+# 只发送最近多少小时内的文章
+LOOKBACK_HOURS = 24
 
 
 def download_text(url: str, timeout: int = 60) -> str:
@@ -27,13 +30,17 @@ def download_text(url: str, timeout: int = 60) -> str:
 
 def load_feeds_from_opml_url(opml_url: str) -> list[str]:
     content = download_text(opml_url, timeout=60)
+
+    # 简单容错：去掉可能的包裹符号/空白
+    content = content.strip().strip("`").strip()
+
     root = ET.fromstring(content)
 
     urls: list[str] = []
     for node in root.findall(".//outline"):
         xml_url = node.attrib.get("xmlUrl")
         if xml_url:
-            urls.append(xml_url.strip())
+            urls.append(xml_url.strip().strip("`").strip())
 
     # 去重且保序
     seen = set()
@@ -58,11 +65,13 @@ def safe_parse_feed(url: str, timeout: int):
     try:
         data = fetch_feed_bytes(url, timeout=timeout)
         parsed = feedparser.parse(data)
-        # feedparser 有时会给出 bozo_exception
+
+        # feedparser 有时会给出 bozo_exception（解析异常/不规范）
         if getattr(parsed, "bozo", 0):
             ex = getattr(parsed, "bozo_exception", None)
             if ex:
                 return parsed, f"bozo_exception: {type(ex).__name__}: {ex}"
+
         return parsed, None
     except Exception as e:
         return None, f"{type(e).__name__}: {e}"
@@ -95,7 +104,6 @@ def fetch_recent_items(feed_urls: list[str], since_utc: datetime, per_feed_limit
             continue
 
         if err:
-            # 可解析但有异常提示（不一定致命），也记录一下方便排查
             print(f"[WARN] {url} -> {err}")
 
         feed_title = getattr(parsed.feed, "title", url) if hasattr(parsed, "feed") else url
@@ -124,13 +132,13 @@ def build_html(items, failures):
     parts = []
 
     if not items:
-        parts.append("<p>过去 24 小时没有抓到新的 RSS 条目。</p>")
+        parts.append(f"<p>过去 {LOOKBACK_HOURS} 小时没有抓到新的 RSS 条目。</p>")
     else:
         by_feed = {}
         for it in items:
             by_feed.setdefault(it["feed"], []).append(it)
 
-        parts.append(f"<p>每日 RSS 摘要（过去 24 小时，共 {len(items)} 条）</p>")
+        parts.append(f"<p>每日 RSS 摘要（过去 {LOOKBACK_HOURS} 小时，共 {len(items)} 条）</p>")
         for feed, lst in by_feed.items():
             parts.append(f"<h3>{escape_html(feed)}</h3><ul>")
             for it in lst:
@@ -142,9 +150,10 @@ def build_html(items, failures):
 
     if failures:
         parts.append(f"<hr/><p>抓取失败（已跳过）: {len(failures)} 个</p><ul>")
-        # 避免邮件太长，只列前 30 个
         for url, reason in failures[:30]:
-            parts.append(f"<li><code>{escape_html(url)}</code><br/><small>{escape_html(reason)}</small></li>")
+            parts.append(
+                f"<li><code>{escape_html(url)}</code><br/><small>{escape_html(reason)}</small></li>"
+            )
         if len(failures) > 30:
             parts.append(f"<li>……省略 {len(failures) - 30} 个</li>")
         parts.append("</ul>")
@@ -152,9 +161,14 @@ def build_html(items, failures):
     return "\n".join(parts)
 
 
-def send_email_outlook(html_body: str):
-    smtp_host = os.environ.get("SMTP_HOST", "smtp-mail.outlook.com")
-    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+def send_email(html_body: str):
+    """
+    通用 SMTP 发信：
+    - 465: SMTP_SSL（QQ 邮箱常用）
+    - 587: STARTTLS（部分服务商常用）
+    """
+    smtp_host = os.environ.get("SMTP_HOST")
+    smtp_port = int(os.environ.get("SMTP_PORT", "465"))
 
     email_user = os.environ["EMAIL_USER"]
     email_pass = os.environ["EMAIL_PASS"]
@@ -168,12 +182,18 @@ def send_email_outlook(html_body: str):
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     context = ssl.create_default_context()
-    with smtplib.SMTP(smtp_host, smtp_port, timeout=60) as server:
-        server.ehlo()
-        server.starttls(context=context)
-        server.ehlo()
-        server.login(email_user, email_pass)
-        server.sendmail(email_user, [email_to], msg.as_string())
+
+    if smtp_port == 465:
+        with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=60, context=context) as server:
+            server.login(email_user, email_pass)
+            server.sendmail(email_user, [email_to], msg.as_string())
+    else:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=60) as server:
+            server.ehlo()
+            server.starttls(context=context)
+            server.ehlo()
+            server.login(email_user, email_pass)
+            server.sendmail(email_user, [email_to], msg.as_string())
 
 
 def main():
@@ -181,11 +201,11 @@ def main():
     if not feeds:
         raise RuntimeError("OPML 没有解析到任何 xmlUrl")
 
-    since = datetime.now(timezone.utc) - timedelta(hours=24)
+    since = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
 
     items, failures = fetch_recent_items(feeds, since_utc=since, per_feed_limit=PER_FEED_LIMIT)
     html = build_html(items, failures)
-    send_email_outlook(html)
+    send_email(html)
 
 
 if __name__ == "__main__":
